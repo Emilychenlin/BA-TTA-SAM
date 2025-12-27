@@ -3,7 +3,7 @@ from configs.base_config import base_config
 
 
 config = {
-    "gpu_ids": "1",
+    "gpu_ids": "0",
     "batch_size": 1,
     "val_batchsize":1,
     "num_workers": 4,
@@ -11,9 +11,9 @@ config = {
     "max_nums": 40,
     "num_points": 3,
     "eval_interval": 1,
-    "dataset": "ISIC",
+    "dataset": "Kvasir",
     "prompt": "box",
-    "out_dir": "output/attention_visual/ISIC",
+    "out_dir": "output/Kvasir_ours", # 输出文件夹名称
     "name": "baseline",
     "augment": True, 
     "corrupt": None,

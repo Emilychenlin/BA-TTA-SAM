@@ -131,8 +131,6 @@ class ImageEncoderViT(nn.Module):
 
             self.blocks.append(block)
             
-        self.anchor = Anchor()
-        self.anchorChecker = AnchorQualityChecker()
         self.shallow_feature = None
         self.deep_feature = None
         self.anchor_map = None
@@ -220,13 +218,7 @@ class ImageEncoderViT(nn.Module):
             all = len(self.blocks)
                 
             # 位置增强
-            for i, blk in enumerate(self.blocks):
-                if i == 5:  # 第6层（索引从0开始）
-                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
-                    self.anchor_map = self.anchor(self.shallow_feature)
-                    if self.anchor_map == None:
-                        print("Edge Anchor Wrong!")
-                    
+            for i, blk in enumerate(self.blocks):    
                 if i in [first, quarter, half, three_quarters]:
                     print("i:", i)
                     x = x + point_tensor  # 在1/4, 2/4, 3/4处添加point_tensor
@@ -271,13 +263,7 @@ class ImageEncoderViT(nn.Module):
             half = len(self.blocks) // 2
             three_quarters = 3 * len(self.blocks) // 4
 
-            for i, blk in enumerate(self.blocks):
-                if i == 5:  # 第6层（索引从0开始）
-                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
-                    self.anchor_map = self.anchor(self.shallow_feature)
-                    if self.anchor_map == None:
-                        print("Edge Anchor Wrong!")
-                
+            for i, blk in enumerate(self.blocks):               
                 if i in [first, quarter, half, three_quarters]:
                     print("i:", i)
                     x = x + box_tensor  # 在1/4, 2/4, 3/4处添加box_tensor
@@ -289,13 +275,7 @@ class ImageEncoderViT(nn.Module):
         elif input_points==None and input_box==None and feature_map==None:
             # print("SAM!")
 
-            for i, blk in enumerate(self.blocks):            
-                if i == 5:  # 第6层（索引从0开始）
-                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
-                    self.anchor_map = self.anchor(self.shallow_feature)
-                    if self.anchor_map == None:
-                        print("Edge Anchor Wrong!")
-                        
+            for i, blk in enumerate(self.blocks):                         
                 x = blk(x)
                 
             self.deep_feature = x

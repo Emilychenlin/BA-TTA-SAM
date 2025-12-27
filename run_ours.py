@@ -19,7 +19,6 @@ from datasets import call_load_dataset
 from utils.eval_utils import AverageMeter, get_prompts
 from utils.tools import create_csv
 
-import segmentation_models_pytorch as smp
 from utils.tools import write_csv
 from utils.tools import  visualize_and_save_masks
 from utils.evaluation import calculate_dice, calculate_miou
@@ -34,11 +33,6 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
     dice_scores = AverageMeter()
 
     train_dataloader, val_dataloader, test_dataloader = load_datasets(cfg, predictor.model.image_encoder.img_size)
-    
-    csv_file_path = os.path.join(cfg.out_dir, 'all_gradients.csv')
-    with open(csv_file_path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["ImageName", "Layer", "InsideGradient", "OutsideGradient"])
 
     for iter, data in enumerate(test_dataloader):
         sum_time = []
@@ -50,19 +44,17 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
         num_images = images.size(0)
 
         # 创建保存目录
-        visual_dir = os.path.join(cfg.out_dir, "visual")
         pred_mask_dir = os.path.join(cfg.out_dir, "pred_masks")
         # matrices = os.path.join(cfg.out_dir, "matrices")
-        attn_path = os.path.join(cfg.out_dir, "attn")
-        os.makedirs(visual_dir, exist_ok=True)
         os.makedirs(pred_mask_dir, exist_ok=True)
-        os.makedirs(attn_path, exist_ok=True)
 
         # 将图像搬到 GPU
         images = images.to(fabric.device)
 
         # 获取 prompts
         prompts = get_prompts(cfg, bboxes, gt_masks)
+        
+        img = images[0].cpu()
 
         if img.dtype == torch.float32 or img.max() <= 1.0:
             img = img * 255.0
@@ -85,7 +77,8 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
         # print("box_coords:", box_coords)
         
         predictor.set_image(
-            image = img_np
+            image = img_np,
+            box = box_coords
         )
 
         # if point_coords.ndim != 2 or point_coords.shape[-1] != 2:
@@ -178,10 +171,6 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
 
     # visualize_all_gradients(csv_file_path, os.path.join(cfg.out_dir, 'Compare_gradient'))
 
-    avg_time = sum(sum_time) / len(sum_time)
-    with open(os.path.join(cfg.out_dir, f"{cfg.dataset}-{cfg.prompt}.csv"), 'a') as f:
-        f.write(f"[Time: {avg_time:.4f}] \n")    
-
     return ious.avg, f1_scores.avg, dice_scores.avg
 
 
@@ -204,8 +193,6 @@ def multi_main(cfg):
 def main(cfg: Box, ckpt: str = None) -> None:
     gpu_ids = cfg.gpu_ids.split(',')
     num_devices = len(gpu_ids)
-    os.makedirs(os.path.join(cfg.out_dir, "logs"), exist_ok=True)
-    logger = CSVLogger(save_dir=os.path.join(cfg.out_dir, "logs"), name="csv_log")
 
     fabric = L.Fabric(
     accelerator="auto",
@@ -223,7 +210,6 @@ def main(cfg: Box, ckpt: str = None) -> None:
         with open(cfg_dict_path, "w") as file:
             yaml.dump(cfg_dict, file)
 
-        os.makedirs(os.path.join(cfg.out_dir, "save"), exist_ok=True)
         # 写入表头
         create_csv(os.path.join(cfg.out_dir, f"{cfg.dataset}-{cfg.prompt}.csv"), csv_head=cfg.csv_keys)
     
@@ -240,8 +226,6 @@ def main(cfg: Box, ckpt: str = None) -> None:
     load_datasets = call_load_dataset(cfg)
 
     test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0)
-
-    del model
 
 
 if __name__ == "__main__":

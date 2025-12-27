@@ -40,12 +40,12 @@ base_config = {
     },
     "datasets": {
         "Kvasir": {
-            "train_dir": "./data/Kvasir-SEG/train/images/",
-            "val_dir": "./data/Kvasir-SEG/val/images/",
-            "test_dir": "./data/Kvasir-SEG/test/images/",
-            "train_list": "./data/Kvasir-SEG/train/train.csv",
-            "val_list": "./data/Kvasir-SEG/val/val.csv",
-            "test_list": "./data/Kvasir-SEG/test/test.csv"
+            "train_dir": "data/Kvasir/train/images/",
+            "val_dir": "data/Kvasir/val/images/",
+            "test_dir": "data/Kvasir/test/images/",
+            "train_list": "data/Kvasir/train/train.csv",
+            "val_list": "data/Kvasir/val/val.csv",
+            "test_list": "data/Kvasir/test/test.csv"
         },
         "BUSI": {
             "train_dir": "./data/BUSI/train/images/",

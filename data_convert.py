@@ -1,3 +1,19 @@
+'''
+data/Kvasir/
+├── train/
+│   ├── images/           # 存放训练集原始图片（不包含 _mask）
+│   ├── masks/            # 存放训练集对应的 mask 图片（_mask 后缀）
+│   └── train.csv         # 训练集图片与 mask 的配对信息 CSV
+├── val/
+│   ├── images/           # 存放验证集原始图片
+│   ├── masks/            # 存放验证集对应的 mask 图片
+│   └── val.csv           # 验证集配对 CSV
+└── test/
+    ├── images/           # 存放测试集原始图片
+    ├── masks/            # 存放测试集对应的 mask 图片
+    └── test.csv          # 测试集配对 CSV
+
+'''
 import os
 import csv
 import shutil
