@@ -4,6 +4,24 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+class AverageMeter:
+    """Computes and stores the average and current value."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
 def calculate_dice(gt_mask, pred_mask, smooth=1e-8):
     """
     Calculate Dice coefficient for gt_mask and pred_mask with white (255) as target region.

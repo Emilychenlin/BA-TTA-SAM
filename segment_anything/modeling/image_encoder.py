@@ -8,15 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-
 from typing import Optional, Tuple, Type
-
 from .common import LayerNorm2d, MLPBlock
-from functools import partial
-import functools
 import numpy as np
-import matplotlib.pyplot as plt
-# from ecotta import build_meta_block, one_part_of_networks, conv_block
 
 def generate_gaussian_heatmap(shape, points, sigma, output_dir='data/point_img/embedding_gas/heatmaps'):
     """
@@ -50,6 +44,121 @@ def generate_gaussian_heatmap(shape, points, sigma, output_dir='data/point_img/e
     heatmap = torch.clamp(heatmap, 0, 1)
     
     return heatmap
+
+def boundary_consistency_loss(F_s, F_d, M, eps=1e-8):
+    """
+    计算 Boundary-Consistent Alignment Loss（基于皮尔逊相关系数）
+
+    参数:
+        F_s: 浅层特征 (B, H, W, C)
+        F_d: 深层特征 (B, H, W, C)
+        M: 锚点 attention map (B, 1, H, W)
+    返回:
+        loss: scalar（越小越好，负相关系数）
+    """
+    M = M.float()
+
+    # 保证 shape 一致 [B, C, H, W]
+    F_s = F_s.permute(0, 3, 1, 2)
+    F_d = F_d.permute(0, 3, 1, 2)
+
+    # 乘上 mask，保留边缘区域
+    F_s_b = F_s * M  # (B, C, H, W)
+    F_d_b = F_d * M
+
+    # reshape 成 (B, C, H*W)
+    B, C, H, W = F_s_b.shape
+    F_s_flat = F_s_b.view(B, C, -1)  # (B, C, N)
+    F_d_flat = F_d_b.view(B, C, -1)
+
+    # 计算每个 batch、每个通道上的皮尔逊相关系数
+    mean_s = F_s_flat.mean(dim=-1, keepdim=True)
+    mean_d = F_d_flat.mean(dim=-1, keepdim=True)
+
+    F_s_centered = F_s_flat - mean_s
+    F_d_centered = F_d_flat - mean_d
+
+    numerator = (F_s_centered * F_d_centered).sum(dim=-1)  # (B, C)
+    denominator = (
+        F_s_centered.pow(2).sum(dim=-1).sqrt() * F_d_centered.pow(2).sum(dim=-1).sqrt() + eps
+    )  # (B, C)
+
+    corr = numerator / denominator  # (B, C)
+
+    # 取 1 - corr 作为 loss（越相关越小）
+    loss_per_channel = 1 - corr  # (B, C)
+
+    # 对 batch 和 channel 求平均
+    loss = loss_per_channel.mean()
+
+    return loss
+
+class Anchor(nn.Module):
+    def __init__(self, alpha=1):
+        super(Anchor, self).__init__()
+        self.alpha = alpha
+    
+    def forward(self, shallow_feature):
+        shallow_feature_permuted = shallow_feature.permute(0, 3, 1, 2)  # (B, C, H, W)
+        
+        # Sobel 
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=shallow_feature.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=shallow_feature.device).view(1, 1, 3, 3)
+        grad_x = F.conv2d(shallow_feature_permuted[:, :1, :, :], sobel_x, padding=1)
+        grad_y = F.conv2d(shallow_feature_permuted[:, :1, :, :], sobel_y, padding=1)
+        edge_map = torch.sqrt(grad_x**2 + grad_y**2)
+        edge_map = edge_map / (edge_map.max() + 1e-8)  # [0, 1]
+
+        anchor_map = self.alpha * edge_map
+        print("anchor_map.shape:", anchor_map.shape)
+
+        return  anchor_map
+
+class AnchorQualityChecker:
+    def __init__(self, threshold_ratio=1.5, min_value=0.1):
+        """
+        :param threshold_ratio: box 内与外部响应比值超过这个阈值才认为是高质量
+        :param min_value: box 内平均值至少大于该值
+        """
+        self.threshold_ratio = threshold_ratio
+        self.min_value = min_value
+
+    def is_high_quality(self, anchor_map, box):
+        """
+        判断 anchor_map 是否为高质量边缘图
+
+        :param anchor_map: Tensor, shape=(1, 1, H, W) 或 (1, H, W)
+        :param box: (x1, y1, x2, y2) 形式的整数坐标
+        :return: bool 是否为高质量
+        """
+        if anchor_map.ndim == 4:
+            anchor_map = anchor_map.squeeze(0).squeeze(0)  # -> (H, W)
+        elif anchor_map.ndim == 3:
+            anchor_map = anchor_map.squeeze(0)  # -> (H, W)
+
+        x1, y1, x2, y2 = box
+        H, W = anchor_map.shape
+
+        # 防止越界
+        x1, x2 = max(0, x1), min(W - 1, x2)
+        y1, y2 = max(0, y1), min(H - 1, y2)
+
+        # 提取 box 区域和非 box 区域
+        box_region = anchor_map[y1:y2+1, x1:x2+1]
+        mask = torch.ones_like(anchor_map, dtype=torch.bool)
+        mask[y1:y2+1, x1:x2+1] = False
+        outside_region = anchor_map[mask]
+
+        # 计算均值（也可以用 max）
+        box_mean = box_region.mean().item()
+        outside_mean = outside_region.mean().item()
+
+        print(f"[AnchorChecker] box_mean={box_mean:.4f}, outside_mean={outside_mean:.4f}")
+
+        if box_mean > self.min_value and box_mean > self.threshold_ratio * outside_mean:
+            return True
+        else:
+            return False
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -131,12 +240,12 @@ class ImageEncoderViT(nn.Module):
 
             self.blocks.append(block)
             
+        self.anchor = Anchor()
+        self.anchorChecker = AnchorQualityChecker()
         self.shallow_feature = None
         self.deep_feature = None
         self.anchor_map = None
 
-        #创建一个名为 self.neck 的 nn.Sequential 对象，用于存储一系列按顺序执行的层。
-        #卷积、归一化-卷积、归一化
         self.neck = nn.Sequential(
             nn.Conv2d(
                 embed_dim,
@@ -163,18 +272,16 @@ class ImageEncoderViT(nn.Module):
                 input_box: torch.Tensor = None, 
                 feature_map: torch.Tensor = None,
     ) -> torch.Tensor:
-        print("x.device in image_encoder first:", x.device)
-        #将图像分割成多个小块（patches），并将每个小块嵌入到一个高维向量空间中
-        #这一步是将图像数据转换为适合Transformer处理的格式。
-        print("Positional embedding shape:", self.pos_embed.shape)
-        print("patch num:", self.img_size//self.patch_size)
-        print("x before patch_embed:", x.shape)
-        print("x.max before conv:", torch.max(x))
-        print("x.min before conv:", torch.min(x))
+        # print("x.device in image_encoder first:", x.device)
+        # print("Positional embedding shape:", self.pos_embed.shape)
+        # print("patch num:", self.img_size//self.patch_size)
+        # print("x before patch_embed:", x.shape)
+        # print("x.max before conv:", torch.max(x))
+        # print("x.min before conv:", torch.min(x))
         x = self.patch_embed(x)
         # 嵌入点信息
-        print("x.max after conv:", torch.max(x))
-        print("x.min after conv:", torch.min(x))
+        # print("x.max after conv:", torch.max(x))
+        # print("x.min after conv:", torch.min(x))
         # position id
         if self.pos_embed is not None:
             x = x + self.pos_embed
@@ -201,11 +308,11 @@ class ImageEncoderViT(nn.Module):
             
             point_tensor += heatmap
             
-            print("point_tensor.shape after heatmap:", point_tensor.shape)
+            # print("point_tensor.shape after heatmap:", point_tensor.shape)
             max_value = torch.max(heatmap)
             min_value = torch.min(heatmap)
-            print("man_value in heatmap:", max_value)
-            print("min_value in heatmap:", min_value)
+            # print("man_value in heatmap:", max_value)
+            # print("min_value in heatmap:", min_value)
 
             # 限制热图值的最大值，防止数值溢出
             point_tensor = torch.clamp(point_tensor, max=1.0)
@@ -218,7 +325,13 @@ class ImageEncoderViT(nn.Module):
             all = len(self.blocks)
                 
             # 位置增强
-            for i, blk in enumerate(self.blocks):    
+            for i, blk in enumerate(self.blocks):
+                if i == 5:  # 第6层（索引从0开始）
+                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
+                    self.anchor_map = self.anchor(self.shallow_feature)
+                    if self.anchor_map == None:
+                        print("Edge Anchor Wrong!")
+                    
                 if i in [first, quarter, half, three_quarters]:
                     print("i:", i)
                     x = x + point_tensor  # 在1/4, 2/4, 3/4处添加point_tensor
@@ -263,7 +376,13 @@ class ImageEncoderViT(nn.Module):
             half = len(self.blocks) // 2
             three_quarters = 3 * len(self.blocks) // 4
 
-            for i, blk in enumerate(self.blocks):               
+            for i, blk in enumerate(self.blocks):
+                if i == 5:  # 第6层（索引从0开始）
+                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
+                    self.anchor_map = self.anchor(self.shallow_feature)
+                    if self.anchor_map == None:
+                        print("Edge Anchor Wrong!")
+                
                 if i in [first, quarter, half, three_quarters]:
                     print("i:", i)
                     x = x + box_tensor  # 在1/4, 2/4, 3/4处添加box_tensor
@@ -275,7 +394,13 @@ class ImageEncoderViT(nn.Module):
         elif input_points==None and input_box==None and feature_map==None:
             # print("SAM!")
 
-            for i, blk in enumerate(self.blocks):                         
+            for i, blk in enumerate(self.blocks):            
+                if i == 5:  # 第6层（索引从0开始）
+                    self.shallow_feature = x  # 形状: (B, H, W, C) = (1, 64, 64, 768)
+                    self.anchor_map = self.anchor(self.shallow_feature)
+                    if self.anchor_map == None:
+                        print("Edge Anchor Wrong!")
+                        
                 x = blk(x)
                 
             self.deep_feature = x
@@ -283,15 +408,35 @@ class ImageEncoderViT(nn.Module):
         else:
             raise ValueError("Wrong！")
 
-        print("x in image_encoder before permute:", x.shape)
+        # print("x in image_encoder before permute:", x.shape)
 
         #调整维度后再送入neck层
         temp_x=x.permute(0, 3, 1, 2)
-        print("x in image_encoder after permute:", x.shape)
+        # print("x in image_encoder after permute:", x.shape)
         x = self.neck(temp_x)
-        print("x in image_encoder at last:", x.shape)
+        # print("x in image_encoder at last:", x.shape)
+        
+        if input_box != None:
+            x1, y1, x2, y2 = input_box
+            is_good = self.anchorChecker.is_high_quality(anchor_map=self.anchor_map, box=(x1, y1, x2, y2))
             
-        return x
+            if is_good:
+                loss_align = boundary_consistency_loss(
+                    self.shallow_feature,
+                    self.deep_feature,
+                    self.anchor_map
+                )
+                print("High anchor!")
+            else:
+                # 设置一个无效值
+                loss_align = torch.tensor(0.0, device=self.shallow_feature.device, requires_grad=True)
+                print("Loss_align is invalide!")
+        else:
+            # 设置一个无效值
+            loss_align = torch.tensor(0.0, device=self.shallow_feature.device, requires_grad=True)
+            print("Anchor!")
+            
+        return x, loss_align
 
 #规范+注意力+（残差）-规范+MLP
 class Block(nn.Module):
@@ -402,10 +547,6 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
-        # 新增的全局变量
-        # self.Q = None
-        # self.K = None
-        # self.V = None
         self.Attn = None  # 保存注意力分数
     
     # 位置增强
@@ -424,392 +565,13 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
         
         self.Attn=attn
-        print("Attn.shape:", self.Attn.shape)
+        # sprint("Attn.shape:", self.Attn.shape)
         
         x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
-    
-# class DepthWiseConv(nn.Module):
-#     def __init__(self,in_channel,out_channel):
- 
-#         #这一行千万不要忘记
-#         super(DepthWiseConv, self).__init__()
- 
-#         # 逐通道卷积
-#         self.depth_conv = nn.Conv2d(in_channels=in_channel,
-#                                     out_channels=in_channel,
-#                                     kernel_size=3,
-#                                     stride=1,
-#                                     padding=1,
-#                                     groups=in_channel)
-#         # groups是一个数，当groups=in_channel时,表示做逐通道卷积
- 
-#         #逐点卷积
-#         self.point_conv = nn.Conv2d(in_channels=in_channel,
-#                                     out_channels=out_channel,
-#                                     kernel_size=1,
-#                                     stride=1,
-#                                     padding=0,
-#                                     groups=1)
-    
-#     def forward(self,input):
-#         out = self.depth_conv(input)
-#         out = self.point_conv(out)
-#         return out
 
-# class Anchor(nn.Module):
-#     def __init__(self, embed_dim=768, alpha=1.0, use_sobel_init=True):
-#         super(Anchor, self).__init__()
-#         self.embed_dim = embed_dim
-#         self.alpha = alpha
-#         self.use_sobel_init = use_sobel_init
-
-#         # 可学习边缘提取器（用 Depthwise Separable Conv）
-#         self.edge_extractor = nn.Sequential(
-#             DepthWiseConv(embed_dim, 1),  # 输出通道为1（注意力图）
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, shallow_feature):
-#         # 输入：[B, H, W, C] -> [B, C, H, W]
-#         shallow_feature_permuted = shallow_feature.permute(0, 3, 1, 2)
-
-#         # 可学习 anchor map
-#         anchor_map_learned = self.edge_extractor(shallow_feature_permuted)  # [B, 1, H, W]
-
-#         # # Sobel 初始化（可选）
-#         # if self.use_sobel_init :
-#         #     with torch.no_grad():
-#         #         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-#         #                                dtype=torch.float32, device=shallow_feature.device).view(1, 1, 3, 3)
-#         #         sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-#         #                                dtype=torch.float32, device=shallow_feature.device).view(1, 1, 3, 3)
-#         #         grad_x = F.conv2d(shallow_feature_permuted[:, :1], sobel_x, padding=1)
-#         #         grad_y = F.conv2d(shallow_feature_permuted[:, :1], sobel_y, padding=1)
-#         #         sobel_map = torch.sqrt(grad_x ** 2 + grad_y ** 2)
-#         #         sobel_map = sobel_map / (sobel_map.max() + 1e-8)
-#         #         anchor_map = (1 - self.alpha) * anchor_map_learned + self.alpha * sobel_map
-#         # else:
-#         anchor_map = anchor_map_learned
-
-#         print("anchor_map.shape:", anchor_map.shape)
-#         return anchor_map
-    
-# 在主函数中调用钩子注册
-def register_hooks(model, layers_to_hook, save_heatmaps, batch_idx, output_dir):
-    """
-    注册梯度钩子到指定的 Attention 层。
-    """
-    attention_count = 1  # 用于跟踪 Attention 层的索引
-    hook_handles = []
-
-    for name, layer in model.named_modules():
-        if isinstance(layer, Attention):
-            if attention_count in layers_to_hook:
-                # 注册反向传播的钩子
-                hook_handle =layer.register_forward_hook(
-                    lambda module, input, output, layer_idx=attention_count: register_gradient_hooks(
-                        module, save_heatmaps, output_dir, layer_idx, batch_idx
-                    )
-                )
-                print(f"梯度钩子已注册到第 {attention_count} 个 Attention 层")
-                hook_handles.append(hook_handle)
-            attention_count += 1
-
-    return hook_handles
-def register_gradient_hooks(module, save_heatmaps, output_dir, layer_idx, batch_idx):
-    print("enter!")
-    saved_grads = {}
-
-    # 确保 Q, K, V, attn 需要梯度
-    # module.Q.retain_grad()
-    # module.K.retain_grad()
-    # module.V.retain_grad()
-    module.attn.retain_grad()
-
-    # 注册梯度钩子
-    def save_grad(name):
-        def hook(grad):
-            print(f"[Hook] {name} gradient computed with shape: {grad.shape}")
-            saved_grads[name] = grad.detach().cpu().numpy()
-        return hook
-
-    # module.Q.register_hook(save_grad("Q_grad"))
-    # module.K.register_hook(save_grad("K_grad"))
-    # module.V.register_hook(save_grad("V_grad"))
-    module.attn.register_hook(save_grad("attn_grad"))
-    print("Gradient hooks registered!")
-
-    # 在 backward 完成后，调用 save_heatmaps
-    def save_grads_hook(module, grad_input, grad_output):
-        print(f"[Hook] save_grads_hook triggered for layer {layer_idx}, batch {batch_idx}")
-        save_heatmaps(
-            batch_idx=batch_idx,
-            layer_idx=layer_idx,
-            Q=saved_grads.get("Q_grad"),
-            K=saved_grads.get("K_grad"),
-            V=saved_grads.get("V_grad"),
-            attn=saved_grads.get("attn_grad"),
-            output_dir=output_dir
-        )
-
-    # 注册反向传播钩子
-    module.register_full_backward_hook(save_grads_hook)
-    print("Full backward hook registered!")
-
-# def register_gradient_hooks(module, save_heatmaps, output_dir, layer_idx, batch_idx):
-#     """
-#     在 Q, K, V, attn 上注册梯度钩子。
-#     """
-#     print("enter!")
-
-#     saved_grads = {}
-
-#     # 确保 Q, K, V, attn 需要梯度
-#     module.Q.retain_grad()
-#     module.K.retain_grad()
-#     module.V.retain_grad()
-#     module.attn.retain_grad()
-
-#     # 注册梯度钩子
-#     def save_grad(name):
-#         def hook(grad):
-#             saved_grads[name] = grad.detach().cpu().numpy()  # 存储梯度
-#             print(f"{name} 已保存，形状: {grad.shape}")  # 调试信息
-#         return hook
-
-#     module.Q.register_hook(save_grad("Q_grad"))
-#     module.K.register_hook(save_grad("K_grad"))
-#     module.V.register_hook(save_grad("V_grad"))
-#     module.attn.register_hook(save_grad("attn_grad"))
-#     print("已注册！")
-
-#     # 在 backward 完成后，调用 save_heatmaps
-#     def save_grads_hook(module, grad_input, grad_output):
-#         print("已进入 save_grads_hook！")
-#         print("batch_idx in register_gradient_hooks:", batch_idx)
-
-#         save_heatmaps(
-#             batch_idx=batch_idx,
-#             layer_idx=layer_idx,
-#             Q=saved_grads.get("Q_grad"),
-#             K=saved_grads.get("K_grad"),
-#             V=saved_grads.get("V_grad"),
-#             attn=saved_grads.get("attn_grad"),
-#             output_dir=output_dir
-#         )
-
-#     # 注册反向传播钩子
-#     module.register_full_backward_hook(save_grads_hook)
-#     print("已调用！")
-
-
-# def register_gradient_hooks(module, save_heatmaps, output_dir, layer_idx, batch_idx):
-#     """
-#     在 Q, K, V, attn 上注册梯度钩子。
-#     """
-#     saved_grads = {}
-#     print("enter!")
-
-#     def save_grad(name):
-#         def hook(grad):
-#             saved_grads[name] = grad.detach().cpu().numpy()  # 存储梯度
-#         return hook
-
-#     # 确保 Q, K, V, attn 需要梯度
-#     module.Q.retain_grad()
-#     module.K.retain_grad()
-#     module.V.retain_grad()
-#     module.attn.retain_grad()
-
-#     # 注册梯度钩子
-#     module.Q.register_hook(save_grad("Q_grad"))
-#     module.K.register_hook(save_grad("K_grad"))
-#     module.V.register_hook(save_grad("V_grad"))
-#     module.attn.register_hook(save_grad("attn_grad"))
-#     print("已注册！")
-
-#     # 在 backward 之后保存梯度
-#     def save_grads_hook(_):
-#         print("已进入！")
-#         print("batch_idx in register_gradient_hooks:", batch_idx)
-#         save_heatmaps(
-#             batch_idx=batch_idx,
-#             layer_idx=layer_idx,
-#             Q=saved_grads.get("Q_grad"),
-#             K=saved_grads.get("K_grad"),
-#             V=saved_grads.get("V_grad"),
-#             attn=saved_grads.get("attn_grad"),
-#             output_dir=output_dir
-#         )
-    
-
-#     # 在 backward 完成后，调用 save_heatmaps
-#     module.register_full_backward_hook(save_grads_hook)
-#     print("已调用！")
-# def register_gradient_hooks(module, save_heatmaps, output_dir, layer_idx, batch_idx):
-#     """
-#     在 Q, K, V, attn 上注册梯度钩子。
-#     """
-#     saved_grads = {}
-#     print("enter!")
-
-#     def save_grad(name):
-#         def hook(grad):
-#             saved_grads[name] = grad.detach().cpu().numpy()  # 存储梯度
-#             print(f"{name} 已保存，形状: {grad.shape}")  # 调试信息
-#         return hook
-
-#     # 确保 Q, K, V, attn 需要梯度
-#     module.Q.retain_grad()
-#     module.K.retain_grad()
-#     module.V.retain_grad()
-#     module.attn.retain_grad()
-
-#     # 注册梯度钩子
-#     module.Q.register_hook(save_grad("Q_grad"))
-#     module.K.register_hook(save_grad("K_grad"))
-#     module.V.register_hook(save_grad("V_grad"))
-#     module.attn.register_hook(save_grad("attn_grad"))
-#     print("已注册！")
-
-#     # 在 backward 完成后，调用 save_heatmaps
-#     def save_grads_hook(module, grad_input, grad_output):
-#         print("已进入 save_grads_hook！")
-#         print("batch_idx in register_gradient_hooks:", batch_idx)
-
-#         save_heatmaps(
-#             batch_idx=batch_idx,
-#             layer_idx=layer_idx,
-#             Q=saved_grads.get("Q_grad"),
-#             K=saved_grads.get("K_grad"),
-#             V=saved_grads.get("V_grad"),
-#             attn=saved_grads.get("attn_grad"),
-#             output_dir=output_dir
-#         )
-    
-#     # 在 backward 完成后，调用 save_heatmaps
-#     module.register_full_backward_hook(save_grads_hook)
-#     print("已调用！")
-
-
-
-
-
-# def register_hooks(model, layers_to_hook, save_matrices_to_file, output_dir, current_batch_idx):
-#     attention_count = 1
-#     for name, layer in model.named_modules():
-#         if isinstance(layer, Attention):
-#             if attention_count in layers_to_hook:
-#                 # 使用闭包立即绑定当前 attention_count 的值
-#                 (lambda layer_idx:
-#                     layer.register_forward_hook(
-#                         lambda module, input, output, layer_idx=layer_idx, batch_idx=current_batch_idx: 
-#                             hook_fn(
-#                                 module=module,
-#                                 input=input,
-#                                 output=output,
-#                                 save_matrices_to_file=save_matrices_to_file,
-#                                 output_dir=output_dir,
-#                                 layer_idx=layer_idx,  # 将 attention_count 作为 layer_idx 传递
-#                                 batch_idx=batch_idx  # 传递当前批次的索引
-#                             )
-#                     )
-#                 )(attention_count)  # 立即传递当前值
-#                 print(f"钩子已注册到第 {attention_count} 个 Attention 层")
-#             attention_count += 1
-
-    
-
-# def register_hooks(model, layers_to_hook, save_matrices_to_file, batch_idx, output_dir):
-#     """
-#     注册钩子到指定的 Attention 层。
-#     """
-#     attention_count = 1  # 用于跟踪 Attention 层的索引
-#     hook_handles = []  # 存储所有钩子的句柄
-#     print("进入register!")
-#     for name, layer in model.named_modules():
-#         if isinstance(layer, Attention):  # 确保是 PyTorch 层
-#             if attention_count in layers_to_hook:
-#                 # 定义一个局部函数，正确捕获参数
-#                 def hook_wrapper(attn_count):
-#                     def hook_fn(module, input, output):
-#                         return hook_function(
-#                             module, input, output, save_matrices_to_file, batch_idx, output_dir, attn_count
-#                         )
-#                     return hook_fn
-#                 hook_handle = layer.register_forward_hook(hook_wrapper(attention_count))
-#                 hook_handles.append(hook_handle)
-#                 print(f"钩子已注册到第 {attention_count} 个 Attention 层")
-#             attention_count += 1
-
-#     return hook_handles  # 返回所有钩子的句柄，方便后续删除
-
-# # 假设我们需要捕获 block 3, 6, 9, 12 的信息
-# layers_to_hook = [3, 6, 9, 12]
-# register_hooks(model, layers_to_hook)
-
-
-# # 可视化第一个头的 Q 矩阵
-# def visualize_matrix(matrix, title="Matrix"):
-#     plt.imshow(matrix, cmap='hot', interpolation='nearest')
-#     plt.colorbar()
-#     plt.title(title)
-#     plt.show()
-
-# # # 可视化第3个 block 的第一个头的 attention 矩阵
-# # visualize_matrix(model.blocks[3].attn[0][0].cpu(), title="Attention Matrix Block 3 Head 0")
-
-
-# def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
-#     """
-#     Partition into non-overlapping windows with padding if needed.
-#     Args:
-#         x (tensor): input tokens with [B, H, W, C].
-#         window_size (int): window size.
-
-#     Returns:
-#         windows: windows after partition with [B * num_windows, window_size, window_size, C].
-#         (Hp, Wp): padded height and width before partition
-#     """
-#     B, H, W, C = x.shape
-
-#     pad_h = (window_size - H % window_size) % window_size
-#     pad_w = (window_size - W % window_size) % window_size
-#     if pad_h > 0 or pad_w > 0:
-#         x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-#     Hp, Wp = H + pad_h, W + pad_w
-
-#     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-#     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-#     return windows, (Hp, Wp)
-
-
-# def window_unpartition(
-#     windows: torch.Tensor, window_size: int, pad_hw: Tuple[int, int], hw: Tuple[int, int]
-# ) -> torch.Tensor:
-#     """
-#     Window unpartition into original sequences and removing padding.
-#     Args:
-#         windows (tensor): input tokens with [B * num_windows, window_size, window_size, C].
-#         window_size (int): window size.
-#         pad_hw (Tuple): padded height and width (Hp, Wp).
-#         hw (Tuple): original height and width (H, W) before padding.
-
-#     Returns:
-#         x: unpartitioned sequences with [B, H, W, C].
-#     """
-#     Hp, Wp = pad_hw
-#     H, W = hw
-#     B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-#     x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
-#     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
-
-#     if Hp > H or Wp > W:
-#         x = x[:, :H, :W, :].contiguous()
-#     return x
 def window_partition(x: torch.Tensor, window_size: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.

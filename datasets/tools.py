@@ -201,34 +201,3 @@ def get_largest_mask(mask):
     max_index = torch.argmax(areas).item()
     largest_mask = masks[max_index].unsqueeze(0)  # [1, H, W]
     return largest_mask
-
-
-def encode_mask(mask):
-    """
-    Convert mask with shape [n, h, w] using a new dimension to represent the number of objects
-    to a mask with shape [1, h, w] using 1, 2, 3, ... to represent different objects.
-
-    Args:
-        mask (torch.Tensor): Mask tensor with shape [n, h, w] using a new dimension to represent the number of objects.
-
-    Returns:
-        torch.Tensor: Mask tensor with shape [1, h, w] using 1, 2, 3, ... to represent different objects.
-    """
-    n_objects = mask.shape[0]
-    new_mask = torch.zeros((1, *mask.shape[1:]), dtype=torch.int64)
-    for i in range(n_objects):
-        new_mask[0][mask[i] == 1] = i + 1
-    return new_mask
-
-
-if __name__ == "__main__":
-    mask_encode = np.array([[[0, 0, 1], [2, 0, 2], [0, 3, 3]]])
-    mask_decode = np.array(
-        [
-            [[0, 0, 1], [0, 0, 0], [0, 0, 0]],
-            [[0, 0, 0], [1, 0, 1], [0, 0, 0]],
-            [[0, 0, 0], [0, 0, 0], [0, 1, 1]],
-        ]
-    )
-    encoded_mask = encode_mask(torch.tensor(mask_decode))
-    decoded_mask = decode_mask(torch.tensor(mask_encode))

@@ -5,19 +5,17 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
-from datasets.tools import ResizeAndPad, soft_transform, collate_fn, collate_fn_, decode_mask, get_largest_mask
+from datasets.tools import ResizeAndPad, collate_fn, get_largest_mask
 
 
 class KvasirDataset(Dataset):
-    def __init__(self, cfg, root_dir, list_file, transform=None, if_self_training=False):
+    def __init__(self, cfg, root_dir, list_file, transform=None):
         self.cfg = cfg
         df = pd.read_csv(os.path.join(list_file), encoding='gbk')
         self.name_list = df.iloc[:,0].tolist()
         self.label_list = df.iloc[:,1].tolist()
         self.root_dir = root_dir
         self.transform = transform
-
-        self.if_self_training = if_self_training
 
     def __len__(self):
         return len(self.name_list)
@@ -62,40 +60,14 @@ class KvasirDataset(Dataset):
         # print("(gt_mask > 0).sum():", (gt_mask > 0).sum())
         # assert gt_masks.sum() == (gt_mask > 0).sum()
 
-        if self.if_self_training:
-            image_weak, bboxes_weak, masks_weak, image_strong = soft_transform(image, bboxes, masks, categories)
+        if self.transform:
+            file_names = os.path.splitext(os.path.basename(name))[0]
+            # file_names = os.path.basename(name)
+            image, masks, bboxes = self.transform(image, masks, np.array(bboxes))
 
-            if self.transform:
-                image_weak, masks_weak, bboxes_weak = self.transform(image_weak, masks_weak, np.array(bboxes_weak))
-                image_strong = self.transform.transform_image(image_strong)
-
-            bboxes_weak = np.stack(bboxes_weak, axis=0)
-            masks_weak = np.stack(masks_weak, axis=0)
-            return image_weak, image_strong, torch.tensor(bboxes_weak), torch.tensor(masks_weak).float()
-
-        elif self.cfg.visual:
-            file_name = os.path.splitext(os.path.basename(name))[0]
-            origin_image = image
-            origin_bboxes = bboxes
-            origin_masks = masks
-            if self.transform:
-                padding, image, masks, bboxes = self.transform(image, masks, np.array(bboxes), True)
-
-            bboxes = np.stack(bboxes, axis=0)
-            masks = np.stack(masks, axis=0)
-            origin_bboxes = np.stack(origin_bboxes, axis=0)
-            origin_masks = np.stack(origin_masks, axis=0)
-            return file_name, padding, origin_image, origin_bboxes, origin_masks, image, torch.tensor(bboxes), torch.tensor(masks).float()
-
-        else:
-            if self.transform:
-                file_names = os.path.splitext(os.path.basename(name))[0]
-                # file_names = os.path.basename(name)
-                image, masks, bboxes = self.transform(image, masks, np.array(bboxes))
-
-            bboxes = np.stack(bboxes, axis=0)
-            masks = np.stack(masks, axis=0)
-            return image, torch.tensor(bboxes), torch.tensor(masks).float(), file_names
+        bboxes = np.stack(bboxes, axis=0)
+        masks = np.stack(masks, axis=0)
+        return image, torch.tensor(bboxes), torch.tensor(masks).float(), file_names
 
 def load_datasets(cfg, img_size):
     transform = ResizeAndPad(img_size)
@@ -105,19 +77,6 @@ def load_datasets(cfg, img_size):
         list_file=cfg.datasets.Kvasir.test_list,
         transform=transform,
     )
-    val = KvasirDataset(
-        cfg,
-        root_dir=cfg.datasets.Kvasir.val_dir,
-        list_file=cfg.datasets.Kvasir.val_list,
-        transform=transform,
-    )
-    train = KvasirDataset(
-        cfg,
-        root_dir=cfg.datasets.Kvasir.train_dir,
-        list_file=cfg.datasets.Kvasir.train_list,
-        transform=transform,
-        if_self_training=cfg.augment,
-    )
     test_dataloader = DataLoader(
         test,
         batch_size=cfg.val_batchsize,
@@ -125,36 +84,4 @@ def load_datasets(cfg, img_size):
         num_workers=cfg.num_workers,
         collate_fn=collate_fn,
     )
-    val_dataloader = DataLoader(
-        val,
-        batch_size=cfg.val_batchsize,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_fn,
-    )
-    train_dataloader = DataLoader(
-        train,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_fn,
-    )
-    return train_dataloader, val_dataloader, test_dataloader
-
-def load_datasets_prompt(cfg, img_size):
-    transform = ResizeAndPad(img_size)
-    train = KvasirDataset(
-        cfg,
-        root_dir=cfg.datasets.Kvasir.train_dir,
-        list_file=cfg.datasets.Kvasir.train_list,
-        transform=transform,
-        if_self_training=cfg.augment,
-    )
-    train_dataloader = DataLoader(
-        train,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collate_fn_,
-    )
-    return train_dataloader
+    return test_dataloader

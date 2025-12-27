@@ -1,41 +1,85 @@
 import os
-import time
 import yaml
 import torch
+import numpy as np
 import lightning as L
 from box import Box
-from lightning.fabric.fabric import _FabricOptimizer
-from lightning.fabric.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import CSVLogger
 from segment_anything.build_sam import sam_model_registry
 from segment_anything.predictor import SamPredictor
 
-from PIL import Image
-import numpy as np
-
 from configs.config import cfg
 from datasets import call_load_dataset
-
-from utils.eval_utils import AverageMeter, get_prompts
-from utils.tools import create_csv
-
-from utils.tools import write_csv
-from utils.tools import  visualize_and_save_masks
-from utils.evaluation import calculate_dice, calculate_miou
-import csv
-
-
+from utils.tools import write_csv, visualize_and_save_masks, create_csv, get_prompts
+from utils.evaluation import calculate_dice, calculate_miou, AverageMeter
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
+def collect_params_custom(predictor):
+    """
+    收集：
+    1. image_encoder.blocks.11（ViT最后一层Block）
+    2. image_encoder.heatmap_proj（高斯热力图投影层）
+    3. image_encoder.anchor（Anchor模块）
+
+    返回：
+    - params: List[Parameter]
+    - names: List[str]
+    """
+    target_names = [
+        "image_encoder.blocks.11",
+        # "image_encoder.heatmap_proj",
+        # "image_encoder.anchor",
+    ]
+
+    params = []
+    names = []
+
+    for name, module in predictor.model.named_modules():
+        for tn in target_names:
+            if name == tn or name.startswith(tn + "."):
+                for p_name, p in module.named_parameters(recurse=False):
+                    params.append(p)
+                    names.append(f"{name}.{p_name}")
+
+    print(f" Collected {len(params)} params from specified modules.")
+    return params, names
+
+def configure_model_custom(predictor):
+    """
+    设置模型为部分可训练：
+    只保留以下部分为 requires_grad=True：
+    - image_encoder.blocks.11（最后一层Block）
+    - image_encoder.heatmap_proj
+    - image_encoder.anchor
+    """
+    # 整体冻结
+    predictor.model.eval()
+    predictor.model.requires_grad_(False)
+
+    # 解冻目标模块
+    target_names = [
+        "image_encoder.blocks.11",
+        # "image_encoder.heatmap_proj",
+        # "image_encoder.anchor",
+    ]
+
+    for name, module in predictor.model.named_modules():
+        for tn in target_names:
+            if name == tn or name.startswith(tn + "."):
+                for p in module.parameters(recurse=False):
+                    p.requires_grad = True
+
+    print(" Model configured: Only selected modules are set as trainable.")
+    return predictor
+
+def Adapt(fabric, optimizer, cfg, predictor, load_datasets, name=cfg.name, iters=0):
     ious = AverageMeter()
     f1_scores = AverageMeter()
     dice_scores = AverageMeter()
 
-    train_dataloader, val_dataloader, test_dataloader = load_datasets(cfg, predictor.model.image_encoder.img_size)
+    test_dataloader = load_datasets(cfg, predictor.model.image_encoder.img_size)
 
     for iter, data in enumerate(test_dataloader):
-        sum_time = []
         images, bboxes, gt_masks, img_names = data
         # print("images.shape:", images.shape)
         # print("box.shape:", bboxes.shape)
@@ -76,7 +120,7 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
         # print("box_coords shape:", box_coords.shape)
         # print("box_coords:", box_coords)
         
-        predictor.set_image(
+        loss_align = predictor.set_image(
             image = img_np,
             box = box_coords
         )
@@ -92,6 +136,11 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
         
         # print("pred_masks:", pred_masks.shape)
         # print("logits:", logits.shape)
+        
+        loss_align.backward()
+        optimizer.step()
+        # 更新梯度缓存
+        optimizer.zero_grad()
         
         # 保存掩码图像
         visualize_and_save_masks(pred_masks, pred_mask_dir, img_name)
@@ -169,10 +218,7 @@ def test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0):
     if fabric.global_rank == 0:
         write_csv(os.path.join(cfg.out_dir, f"{cfg.dataset}-{cfg.prompt}.csv"), csv_dict, csv_head=cfg.csv_keys)
 
-    # visualize_all_gradients(csv_file_path, os.path.join(cfg.out_dir, 'Compare_gradient'))
-
     return ious.avg, f1_scores.avg, dice_scores.avg
-
 
 def corrupt_main(cfg):
     for corrupt in cfg.corruptions:
@@ -189,7 +235,6 @@ def multi_main(cfg):
         torch.cuda.empty_cache()
         main(cfg)
 
-
 def main(cfg: Box, ckpt: str = None) -> None:
     gpu_ids = cfg.gpu_ids.split(',')
     num_devices = len(gpu_ids)
@@ -198,9 +243,7 @@ def main(cfg: Box, ckpt: str = None) -> None:
     accelerator="auto",
     devices=num_devices,
     strategy="auto",
-    precision="16-mixed",  # <<< 启用 AMP 混合精度
-    loggers=[CSVLogger(save_dir="your_log_dir", name="your_run_name")]
-    # loggers=[TensorBoardLogger(cfg.out_dir, name=f"{cfg.dataset}-{cfg.prompt}")]
+    precision="16-mixed",  # 启用 AMP 混合精度
 )
 
     if fabric.global_rank == 0:
@@ -222,10 +265,14 @@ def main(cfg: Box, ckpt: str = None) -> None:
     
     predictor = SamPredictor(sam)
     
+    ours_predictor = configure_model_custom(predictor)
+    params, _ = collect_params_custom(ours_predictor)
+    optimizer = torch.optim.AdamW(params, lr=1e-4)
+    
     # 加载数据集的函数
     load_datasets = call_load_dataset(cfg)
 
-    test(fabric, cfg, predictor, load_datasets, name=cfg.name, iters=0)
+    Adapt(fabric, optimizer, cfg, predictor, load_datasets, name=cfg.name, iters=0)
 
 
 if __name__ == "__main__":
